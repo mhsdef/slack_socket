@@ -1,103 +1,92 @@
-defmodule SlackSocket.WebSocketPool do
-  @behaviour NimblePool
+defmodule SlackSocket.WebSocket do
+  use GenServer
 
   require Logger
   require Mint.HTTP
 
-  @socket_open_url "https://slack.com/api/apps.connections.open"
+  defstruct [
+    :conn,
+    :websocket,
+    :request_ref,
+    :status,
+    :resp_headers,
+    :app_callback,
+    :socket_open_url,
+    :token,
+    :closing?
+  ]
 
-  @impl NimblePool
-  def init_worker([{:token, token}] = pool_state) do
-    parent = self()
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
 
-    async = fn ->
-      ws_url = Req.post!(@socket_open_url, auth: {:bearer, token}, json: %{}).body["url"]
-      uri = URI.parse(ws_url)
-      path = if uri.query, do: uri.path <> "?" <> uri.query, else: uri.path
+  @impl true
+  def init(opts \\ []) do
+    state = %__MODULE__{
+      app_callback: opts[:app_callback] || fn _x -> nil end,
+      socket_open_url: opts[:socket_open_url] || "https://slack.com/api/apps.connections.open",
+      token: opts[:app_token] || Application.fetch_env!(:slack_socket, :app_token)
+    }
 
-      with {:ok, conn} <- Mint.HTTP.connect(:https, uri.host, uri.port),
-           {:ok, conn} <- Mint.HTTP.controlling_process(conn, parent),
-           {:ok, conn, ref} <-
-             Mint.WebSocket.upgrade(:wss, conn, path, [],
-               extensions: [
-                 Mint.WebSocket.PerMessageDeflate
-               ]
-             ) do
-        %{
-          conn: conn,
-          websocket: nil,
-          request_ref: ref,
-          status: nil,
-          resp_headers: nil,
-          closing?: false
-        }
-      else
-        _ -> %{}
+    Process.send_after(self(), :connect, some_jitter())
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:connect, %{socket_open_url: url, token: token} = state) do
+    ws_url = Req.post!(url, auth: {:bearer, token}, json: %{}).body["url"]
+    uri = URI.parse(ws_url)
+
+    http_scheme =
+      case uri.scheme do
+        "ws" -> :http
+        "wss" -> :https
       end
-    end
 
-    {:async, async, pool_state}
-  end
+    ws_scheme =
+      case uri.scheme do
+        "ws" -> :ws
+        "wss" -> :wss
+      end
 
-  @impl NimblePool
-  def handle_checkin(result, _from, _old_state, pool_state) do
-    with {:ok, state} <- result,
-         {:ok, conn} <- Mint.HTTP.set_mode(state.conn, :active) do
-      state = put_in(state.conn, conn)
-      {:ok, state, pool_state}
+    path =
+      case uri.query do
+        nil -> uri.path
+        query -> uri.path <> "?" <> query
+      end
+
+    with {:ok, conn} <- Mint.HTTP.connect(http_scheme, uri.host, uri.port),
+         {:ok, conn, ref} <-
+           Mint.WebSocket.upgrade(ws_scheme, conn, path, [],
+             extensions: [
+               Mint.WebSocket.PerMessageDeflate
+             ]
+           ) do
+      {:noreply, %{state | conn: conn, request_ref: ref}}
     else
-      {:error, _} -> {:remove, :closed, pool_state}
+      _ -> {:noreply, state}
     end
   end
 
-  @impl NimblePool
-  def handle_checkout(:checkout, _from, state, pool_state) do
-    with %{conn: conn, request_ref: _ref} <- state,
-         {:ok, conn} <- Mint.HTTP.set_mode(conn, :passive) do
-      state = put_in(state.conn, conn)
-      {:ok, state, state, pool_state}
-    else
-      _ -> {:remove, :closed, pool_state}
-    end
-  end
-
-  @impl NimblePool
+  @impl true
   def handle_info(message, state) do
     case Mint.WebSocket.stream(state.conn, message) do
       {:ok, conn, responses} ->
         state = put_in(state.conn, conn) |> handle_responses(responses)
-        if state.closing?, do: do_close(state), else: {:ok, state}
+        if state.closing?, do: do_close(state), else: {:noreply, state}
 
-      {:error, _conn, reason, _responses} ->
+      {:error, conn, reason, _responses} ->
         Logger.debug("Ws response error: #{inspect(reason)}")
-        {:remove, :closed}
+        state = put_in(state.conn, conn)
+        {:noreply, state}
 
       :unknown ->
-        {:ok, state}
+        {:noreply, state}
     end
-  end
-
-  @impl NimblePool
-  def terminate_worker(_reason, state, pool_state) do
-    do_close(state)
-    {:ok, pool_state}
-  end
-
-  def send_message(data) when is_map(data) do
-    send_message(Jason.encode!(data))
-  end
-
-  def send_message(text) when is_binary(text) do
-    NimblePool.checkout!(
-      __MODULE__,
-      :checkout,
-      fn _pool, state -> {text, send_frame(state, {:text, text})} end
-    )
   end
 
   def handle_frames(state, frames) do
     Enum.reduce(frames, state, fn
-      # reply to pings with pongs
       {:ping, data}, state ->
         {:ok, state} = send_frame(state, {:pong, data})
         state
@@ -112,8 +101,7 @@ defmodule SlackSocket.WebSocketPool do
 
         state
         |> do_ack(json)
-        # akshully, take given adapter and call it
-        |> do_robot_fwd(json["payload"]["event"])
+        |> do_app_callback(json["payload"]["event"])
 
       frame, state ->
         Logger.debug("Unexpected frame received: #{inspect(frame)}")
@@ -121,9 +109,9 @@ defmodule SlackSocket.WebSocketPool do
     end)
   end
 
-  ######################
-  ##     Private      ##
-  ######################
+  ##########################
+  ##       Private        ##
+  ##########################
 
   defp handle_responses(state, responses)
 
@@ -179,11 +167,11 @@ defmodule SlackSocket.WebSocketPool do
     else
       {:error, %Mint.WebSocket{} = websocket, reason} ->
         Logger.debug("Send frame ws error: #{inspect(reason)}")
-        {:error, put_in(state.websocket, websocket)}
+        {:error, put_in(state.websocket, websocket), reason}
 
       {:error, conn, reason} ->
         Logger.debug("Send frame conn error: #{inspect(reason)}")
-        {:error, put_in(state.conn, conn)}
+        {:error, put_in(state.conn, conn), reason}
     end
   end
 
@@ -194,17 +182,20 @@ defmodule SlackSocket.WebSocketPool do
 
   defp do_ack(state, _), do: state
 
-  defp do_robot_fwd(state, %{"type" => "message", "user" => _user} = slack_event) do
-    GenServer.call(state.caller_pid, slack_event)
+  defp do_app_callback(state, slack_event) do
+    state.app_callback.(slack_event)
     state
   end
-
-  defp do_robot_fwd(state, _), do: state
 
   defp do_close(state) do
     # Streaming a close frame may fail if the server has already closed
     # for writing.
     _ = send_frame(state, :close)
     Mint.HTTP.close(state.conn)
+    {:stop, :normal, state}
+  end
+
+  defp some_jitter() do
+    :rand.uniform(10_000)
   end
 end

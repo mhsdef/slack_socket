@@ -14,14 +14,14 @@ defmodule SlackSocket.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger],
-      mod: {SlackSocket.Application, []}
+      extra_applications: [:logger]
     ]
   end
 
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:mint, "~> 1.4"},
       {:mint_web_socket, "~> 1.0"},
       {:nimble_pool, "~> 0.2.6"},
       {:req, "~> 0.3.5"},
