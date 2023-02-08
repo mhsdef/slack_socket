@@ -24,7 +24,7 @@ defmodule SlackSocket.MixProject do
       {:mint, "~> 1.4"},
       {:mint_web_socket, "~> 1.0"},
       {:req, "~> 0.3.5"},
-      {:slack_web_api, github: "defmhs/slack_web_api"}
+      {:slack_web_api, github: "mhsdef/slack_web_api"}
     ]
   end
 end
